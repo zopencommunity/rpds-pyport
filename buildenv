@@ -29,6 +29,12 @@ zopen_get_version() {
 }
 
 zopen_init() {
+  : # nothing; wheel download happens in zopen_verify_wheels (the MAKE step)
+}
+
+ZOPEN_MAKE="zopen_verify_wheels"
+zopen_verify_wheels() {
+  rm -rf dist
   mkdir -p dist
 
   for _pv in $(_zopen_python_versions); do
@@ -42,24 +48,11 @@ zopen_init() {
       return 1
     fi
     printInfo "Downloaded dist/${_wheel}"
-  done
-}
 
-ZOPEN_MAKE="zopen_verify_wheels"
-zopen_verify_wheels() {
-  _missing=""
-  for _pv in $(_zopen_python_versions); do
-    _tag="cp$(echo "${_pv}" | tr -d '.')"
-    _found=false
-    for _whl in dist/*-"${_tag}"-none-any.whl dist/*-"${_tag}"-*-*.whl; do
-      [ -f "${_whl}" ] && { _found=true; break; }
-    done
-    ${_found} || _missing="${_missing} ${_pv}"
+    _zopen_python_ensure_venv_for "${_pv}" || return 1
+    deactivate
   done
-  if [ -n "${_missing}" ]; then
-    printError "Missing prebuilt wheel(s) for Python:${_missing}"
-    return 1
-  fi
+
   printInfo "All prebuilt wheels present in dist/"
 }
 
