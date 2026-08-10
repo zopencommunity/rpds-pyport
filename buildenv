@@ -1,0 +1,119 @@
+# bump: rpds-py-version /RPDS_PY_VERSION="(.*)"/ https://github.com/crate-py/rpds.git|semver:*
+RPDS_PY_VERSION="2026.6.3"
+
+###
+### Build control file for the python-rpds-pyport port
+###
+### rpds-py is a Rust extension (persistent data structures).
+### Required by: referencing -> jsonschema -> mcp -> fastmcp
+### Cross-compiled from LoP using the IBM Rust cross-compiler for s390x-ibm-zos.
+###
+
+export ZOPEN_PROJECT_NAME="python-rpds-py"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_STABLE_URL="https://github.com/crate-py/rpds.git"
+export ZOPEN_STABLE_TAG="v${RPDS_PY_VERSION}"
+export ZOPEN_STABLE_DEPS="check_python grep curl"
+export ZOPEN_DEV_URL=""
+export ZOPEN_DEV_DEPS="check_python grep curl"
+export ZOPEN_CATEGORIES="development library"
+export ZOPEN_RUNTIME_DEPS="check_python"
+
+export ZOPEN_BUILD_SYSTEM="Python"
+export ZOPEN_COMP="skip"
+export ZOPEN_PYTHON_WHEEL_RETAG="false"
+export _RPDS_PY_RELEASE_BASE="https://github.com/zopencommunity/python-rpds-pyport/releases/download/v${RPDS_PY_VERSION}"
+
+zopen_get_version() {
+  echo "${RPDS_PY_VERSION}"
+}
+
+zopen_init() {
+  mkdir -p dist
+
+  for _pv in $(_zopen_python_versions); do
+    _tag="cp$(echo "${_pv}" | tr -d '.')"
+    _wheel="rpds_py-${RPDS_PY_VERSION}-${_tag}-none-any.whl"
+    _url="${_RPDS_PY_RELEASE_BASE}/${_wheel}"
+
+    printInfo "Fetching ${_wheel}"
+    if ! curl -fsSL -o "dist/${_wheel}" "${_url}"; then
+      printError "Failed to download ${_wheel} from ${_url}"
+      return 1
+    fi
+    printInfo "Downloaded dist/${_wheel}"
+  done
+}
+
+ZOPEN_MAKE="zopen_verify_wheels"
+zopen_verify_wheels() {
+  _missing=""
+  for _pv in $(_zopen_python_versions); do
+    _tag="cp$(echo "${_pv}" | tr -d '.')"
+    _found=false
+    for _whl in dist/*-"${_tag}"-none-any.whl dist/*-"${_tag}"-*-*.whl; do
+      [ -f "${_whl}" ] && { _found=true; break; }
+    done
+    ${_found} || _missing="${_missing} ${_pv}"
+  done
+  if [ -n "${_missing}" ]; then
+    printError "Missing prebuilt wheel(s) for Python:${_missing}"
+    return 1
+  fi
+  printInfo "All prebuilt wheels present in dist/"
+}
+
+zopen_python_test() {
+  python - <<'PYEOF'
+import sys
+failures = 0
+
+def check(label, expr):
+    global failures
+    if not expr:
+        print("FAIL:", label, file=sys.stderr)
+        failures += 1
+    else:
+        print("PASS:", label)
+
+try:
+    import rpds
+except ImportError as exc:
+    print("FAIL: import rpds -", exc, file=sys.stderr)
+    sys.exit(1)
+
+m = rpds.HashTrieMap({"a": 1, "b": 2})
+check("HashTrieMap get",    m["a"] == 1)
+check("HashTrieMap insert", m.insert("c", 3)["c"] == 3)
+check("HashTrieMap immutable", "c" not in m)
+
+s = rpds.HashTrieSet([1, 2, 3])
+check("HashTrieSet contains",  2 in s)
+check("HashTrieSet immutable", 4 not in s)
+
+lst = rpds.List([10, 20, 30])
+check("List first", lst.first == 10)
+check("List len",   len(lst) == 3)
+
+print()
+print("rpds-py", sys.version.split()[0],
+      "- %d passed, %d failed" % (7 - failures, failures))
+sys.exit(failures)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null || echo 0)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null || echo 0)
+  interpreters=$(grep -c "Running tests with Python" "${chk}" 2>/dev/null || echo 0)
+  interpreters_with_output=$(grep -c "rpds-py.*passed" "${chk}" 2>/dev/null || echo 0)
+  silent=$((interpreters - interpreters_with_output))
+  if [ "${silent}" -gt 0 ]; then
+    failed=$((failed + silent))
+  fi
+  total=$((passed + failed))
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
