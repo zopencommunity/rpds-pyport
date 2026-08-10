@@ -2,14 +2,14 @@
 RPDS_PY_VERSION="2026.6.3"
 
 ###
-### Build control file for the python-rpds-pyport port
+### Build control file for the rpds-pyport port
 ###
 ### rpds-py is a Rust extension (persistent data structures).
 ### Required by: referencing -> jsonschema -> mcp -> fastmcp
 ### Cross-compiled from LoP using the IBM Rust cross-compiler for s390x-ibm-zos.
 ###
 
-export ZOPEN_PROJECT_NAME="python-rpds-py"
+export ZOPEN_PROJECT_NAME="rpds-py"
 export ZOPEN_BUILD_LINE="STABLE"
 export ZOPEN_STABLE_URL="https://github.com/crate-py/rpds.git"
 export ZOPEN_STABLE_TAG="v${RPDS_PY_VERSION}"
@@ -22,7 +22,7 @@ export ZOPEN_RUNTIME_DEPS="check_python"
 export ZOPEN_BUILD_SYSTEM="Python"
 export ZOPEN_COMP="skip"
 export ZOPEN_PYTHON_WHEEL_RETAG="false"
-export _RPDS_PY_RELEASE_BASE="https://github.com/zopencommunity/python-rpds-pyport/releases/download/v${RPDS_PY_VERSION}"
+export _RPDS_PY_RELEASE_BASE="https://github.com/zopencommunity/rpds-pyport/releases/download/v${RPDS_PY_VERSION}"
 
 zopen_get_version() {
   echo "${RPDS_PY_VERSION}"
