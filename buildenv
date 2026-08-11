@@ -13,6 +13,14 @@ RPDS_PY_VERSION="2026.6.3"
 export ZOPEN_PROJECT_NAME="rpds-py"
 export ZOPEN_BUILD_LINE="STABLE"
 export ZOPEN_TYPE="BARE"
+# Required even though nothing is fetched from it: checkEnv exempts only
+# ZOPEN_TYPE=LOCAL, so a BARE port without a URL fails with "Building from
+# stable, but ZOPEN_STABLE_URL not specified" before doing anything. getCode
+# returns early for BARE and never clones, so this records which upstream
+# source the prebuilt wheels were cross-compiled from, as fdport does.
+export ZOPEN_STABLE_URL="https://github.com/crate-py/rpds.git"
+export ZOPEN_STABLE_TAG="v${RPDS_PY_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/crate-py/rpds.git"
 export ZOPEN_STABLE_DEPS="check_python curl"
 export ZOPEN_DEV_DEPS="check_python curl"
 export ZOPEN_CATEGORIES="development library"
@@ -28,8 +36,12 @@ zopen_get_version() {
 }
 
 zopen_init() {
-  _py=$( (check_python --version 2>&1 || python3 --version 2>&1) | \
-         grep -oE '[0-9]+\.[0-9]+' | head -1 | tr -d '.')
+  # Ask the interpreter for its own tag: z/OS grep has no -o (FSUMA930), grep
+  # is not an implicit dependency for a non-Python-build-system port, and IBM's
+  # banner ("IBM Open Enterprise SDK for Python 3.12.13") puts the version in a
+  # different field from upstream CPython's. check_python installs no
+  # executable, so that branch could never have run either.
+  _py=$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])') || return 1
   _wheel="rpds_py-${RPDS_PY_VERSION}-cp${_py}-none-any.whl"
   _url="https://github.com/zopencommunity/rpds-pyport/releases/download/v${RPDS_PY_VERSION}/${_wheel}"
 
@@ -39,7 +51,9 @@ zopen_init() {
     printError "Build the wheel on LoP with build_zos_wheel.py and upload as a release asset."
     return 1
   }
-  chtag -t -c ISO8859-1 "${_wheel}" 2>/dev/null || true
+  # A wheel is a zip; tagging it as text invites conversion on read. fdport
+  # marks its downloaded artifact binary for the same reason.
+  chtag -b "${_wheel}" 2>/dev/null || true
 }
 
 zopen_custom_check() {
@@ -99,10 +113,25 @@ zopen_custom_install() {
   mkdir -p "${ZOPEN_INSTALL_DIR}/lib/python"
   python3 -m pip install --quiet --no-deps --target="${ZOPEN_INSTALL_DIR}/lib/python" "${_wheel}"
 
-  mkdir -p "${ZOPEN_INSTALL_DIR}/dist"
-  cp "${_wheel}" "${ZOPEN_INSTALL_DIR}/dist/"
+  # Stage for the wheel index in the port's artifact directory, which is where
+  # CI looks (install/dist/*.whl). Not under ZOPEN_INSTALL_DIR: that tree is
+  # what gets packaged, so a wheel there ships a second copy of everything
+  # already under lib/python and is invisible to CI.
+  mkdir -p "${ZOPEN_ROOT}/install/dist"
+  cp "${_wheel}" "${ZOPEN_ROOT}/install/dist/"
 
   printInfo "Installed rpds-py ${RPDS_PY_VERSION} from ${_wheel}"
+}
+
+# Without ZOPEN_BUILD_SYSTEM="Python" nothing adds lib/python to PYTHONPATH --
+# zopen-build only emits that .env snippet for Python-build-system ports -- so
+# the module would install and still not be importable, and the install
+# validation below would fail.
+zopen_append_to_env() {
+  cat <<ZZ
+PYTHONPATH="\${PYTHONPATH}:\${PWD}/lib/python"
+export PYTHONPATH="\$(deleteDuplicateEntries "\$PYTHONPATH" ":")"
+ZZ
 }
 
 zopen_append_to_validate_install() {
@@ -111,8 +140,14 @@ zopen_append_to_validate_install() {
 
 zopen_check_results() {
   dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
-  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null || echo 0)
-  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null || echo 0)
+  # No "|| echo 0": grep -c already prints 0 when nothing matches and also
+  # exits 1, so the fallback appended a second zero and $(( )) below died with
+  # FSUM9224 bad number "0\n0" -- on every clean run, since a clean run has no
+  # FAIL: lines. GNU grep behaves the same, so this is not about which grep.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
   total=$((passed + failed))
   echo "actualFailures:${failed}"
   echo "totalTests:${total}"
