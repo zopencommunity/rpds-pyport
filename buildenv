@@ -7,7 +7,13 @@ RPDS_PY_VERSION="2026.6.3"
 ### rpds-py is a Rust extension (persistent data structures).
 ### Required by: referencing -> jsonschema -> mcp -> fastmcp
 ### Cross-compiled from LoP using IBM's Rust cross-compiler for s390x-ibm-zos.
-### Same BARE pattern as fdport/ripgrepport/pydantic-coreport.
+### Same BARE pattern as fdport/ripgrepport/cryptographyport.
+###
+### Keeping ZOPEN_BUILD_SYSTEM="Python" matters: it is what stages a wheel per
+### interpreter for the wheel index and runs the check once per interpreter. A
+### cross-compiled binary nobody loaded is the main risk here, so nothing is
+### published until the interpreter it claims to support has actually
+### exercised the data structures with it.
 ###
 
 export ZOPEN_PROJECT_NAME="rpds-py"
@@ -26,106 +32,238 @@ export ZOPEN_DEV_DEPS="check_python curl"
 export ZOPEN_CATEGORIES="development library"
 export ZOPEN_RUNTIME_DEPS="check_python"
 
+export ZOPEN_BUILD_SYSTEM="Python"
+export ZOPEN_BOOTSTRAP="skip"
 export ZOPEN_CONFIGURE="skip"
-export ZOPEN_MAKE="skip"
-export ZOPEN_CHECK="zopen_custom_check"
-export ZOPEN_INSTALL="zopen_custom_install"
+export ZOPEN_COMP="skip"
+export ZOPEN_MAKE="zopen_custom_build"
+
+WHEEL_BASE_URL="https://github.com/zopencommunity/rpds-pyport/releases/download/v${RPDS_PY_VERSION}"
 
 zopen_get_version() {
   echo "${RPDS_PY_VERSION}"
 }
 
-zopen_init() {
-  # Ask the interpreter for its own tag: z/OS grep has no -o (FSUMA930), grep
-  # is not an implicit dependency for a non-Python-build-system port, and IBM's
-  # banner ("IBM Open Enterprise SDK for Python 3.12.13") puts the version in a
-  # different field from upstream CPython's. check_python installs no
-  # executable, so that branch could never have run either.
-  _py=$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])') || return 1
-  _wheel="rpds_py-${RPDS_PY_VERSION}-cp${_py}-none-any.whl"
-  _url="https://github.com/zopencommunity/rpds-pyport/releases/download/v${RPDS_PY_VERSION}/${_wheel}"
-
-  printInfo "Downloading ${_wheel}"
-  curl -fsSL -o "${_wheel}" "${_url}" || {
-    printError "Failed to download ${_wheel}"
-    printError "Build the wheel on LoP with build_zos_wheel.py and upload as a release asset."
-    return 1
-  }
-  # A wheel is a zip; tagging it as text invites conversion on read. fdport
-  # marks its downloaded artifact binary for the same reason.
-  chtag -b "${_wheel}" 2>/dev/null || true
+# The platform tag in a native wheel's name is not a constant, so it cannot be
+# written literally here. 3.12 and 3.13 report os390_<release>_<model> while
+# 3.14 reports plain "zos", and the model field names the machine that built
+# the wheel rather than anything about this port -- 8561 is a machine type, so
+# a rebuild on different hardware moves the name again.
+#
+# Ask the interpreter what it calls this platform, then fall back to the tags
+# actually in use. Whichever exists is the right one.
+_rpds_platform_tags() {
+  _pt_local=$("$(_zopen_python_interpreter_path "$1")" -c \
+    'import sysconfig; print(sysconfig.get_platform().replace("-","_").replace(".","_"))' \
+    2>/dev/null)
+  echo "${_pt_local} zos os390_29_00_8561"
 }
 
-zopen_custom_check() {
-  _wheel=$(ls rpds_py-*.whl 2>/dev/null | head -1)
-  [ -n "${_wheel}" ] || { printError "No wheel found"; return 1; }
+# Fetch one prebuilt wheel per interpreter, under its native name. Do not fetch
+# a hand-renamed -none-any asset: renaming a wheel leaves the internal WHEEL
+# metadata still declaring the original platform tag, which is malformed per
+# PEP 427, and it does not self-heal because retagging treats a -none-any name
+# carrying a cp3XY python tag as already done. Letting
+# _zopen_python_retag_wheel do it rewrites the filename, the WHEEL metadata and
+# RECORD together.
+zopen_init() {
+  mkdir -p wheels || return 1
+  for _pv in $(_zopen_python_versions); do
+    _tag="cp$(echo "${_pv}" | tr -d '.')"
 
-  python3 -m venv .check_venv
-  . .check_venv/bin/activate
-  pip install --quiet --no-deps "${_wheel}"
+    # already fetched on an earlier run, under whatever tag it carries
+    _have=""
+    for _cand in wheels/rpds_py-${RPDS_PY_VERSION}-${_tag}-${_tag}-*.whl; do
+      [ -f "${_cand}" ] && { _have="${_cand}"; break; }
+    done
+    [ -n "${_have}" ] && continue
 
-  python3 - <<'PYEOF'
+    _tried=""
+    _got=""
+    for _plat in $(_rpds_platform_tags "${_pv}"); do
+      case " ${_tried} " in *" ${_plat} "*) continue ;; esac
+      _tried="${_tried} ${_plat}"
+      _whl="rpds_py-${RPDS_PY_VERSION}-${_tag}-${_tag}-${_plat}.whl"
+      if curl -fsSL -o "wheels/${_whl}" "${WHEEL_BASE_URL}/${_whl}" 2>/dev/null; then
+        printInfo "Fetched ${_whl}"
+        # A wheel is a zip; tagging it as text invites conversion on read.
+        chtag -b "wheels/${_whl}"
+        _got="${_whl}"
+        break
+      fi
+      rm -f "wheels/${_whl}"
+    done
+
+    if [ -z "${_got}" ]; then
+      printSoftError "No prebuilt wheel for Python ${_pv} at ${WHEEL_BASE_URL}"
+      printSoftError "Tried platform tags:${_tried}"
+      printSoftError "rpds-py has no abi3 build -- a Rust extension is compiled against"
+      printSoftError "one CPython ABI -- so each interpreter needs its own cross-compile"
+      printSoftError "attached to the v${RPDS_PY_VERSION} release."
+      return 1
+    fi
+  done
+}
+
+# rpds has no runtime dependencies, so this venv needs nothing extra. It is
+# still created with --system-site-packages to stay consistent with the other
+# prebuilt-wheel ports, where the interpreter's bundled packages are load
+# bearing.
+_rpds_venv_for() {
+  _cv_dir=$(_zopen_python_venv_dir "$1")
+  if [ ! -f "${_cv_dir}/bin/activate" ]; then
+    printInfo "Creating virtual environment for ${1} in ${_cv_dir} (with system packages)"
+    "$(_zopen_python_interpreter_path "$1")" -m venv --system-site-packages "${_cv_dir}" || return 1
+  fi
+  . "${_cv_dir}/bin/activate" || return 1
+  pip install --disable-pip-version-check --quiet setuptools build installer wheel
+}
+
+# Stands in for compiling. Everything the Python build system would do is still
+# done -- verify the interpreters, create a virtual environment for each, put
+# that interpreter's wheel in dist/, retag -- except the compiling itself. The
+# per-interpreter venv is not optional: the check phase runs in it and fails
+# with "No virtual environment at .venv-3.13" without it.
+zopen_custom_build() {
+  _zopen_python_verify_interpreters || return 1
+
+  rm -rf dist
+  mkdir -p dist || return 1
+
+  for _pv in $(_zopen_python_versions); do
+    _rpds_venv_for "${_pv}" || return 1
+    _tag="cp$(echo "${_pv}" | tr -d '.')"
+    # Glob rather than reconstruct the name: zopen_init already resolved which
+    # platform tag exists, and it is not the same for every interpreter.
+    _src=""
+    for _cand in wheels/rpds_py-${RPDS_PY_VERSION}-${_tag}-${_tag}-*.whl; do
+      [ -f "${_cand}" ] && { _src="${_cand}"; break; }
+    done
+    if [ -z "${_src}" ]; then
+      printSoftError "No wheel staged for Python ${_pv} in wheels/"
+      deactivate
+      return 1
+    fi
+    cp "${_src}" dist/ || { deactivate; return 1; }
+    printInfo "Staged $(basename "${_src}") for Python ${_pv}"
+    deactivate
+  done
+
+  # Retag to cp3XY-none-any so a wheel is not pinned to the z/OS release and
+  # machine model of the box that produced it. The tag is read from each
+  # wheel's own filename, so the interpreter active here does not matter.
+  _rpds_venv_for "$(_zopen_python_primary_version)" || return 1
+  _zopen_python_retag_wheel
+  _rc=$?
+  deactivate
+  return ${_rc}
+}
+
+# Called once per interpreter, with that interpreter's environment active and
+# its wheel already installed. Loading the extension and exercising the data
+# structures is the point: it is the only thing that shows a wheel built
+# off-platform works on this one.
+zopen_python_test() {
+  python - <<'PYEOF'
 import sys
-failures = 0
 
-def check(label, expr):
-    global failures
-    if expr:
-        print("PASS:", label)
-    else:
-        print("FAIL:", label, file=sys.stderr)
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
         failures += 1
+
 
 try:
     import rpds
 except ImportError as exc:
+    # Report as a failure rather than crashing, so zopen_check_results sees a
+    # count instead of an empty log.
     print("FAIL: import rpds -", exc, file=sys.stderr)
+    print("rpds-py FAILED to import on Python %s" % sys.version.split()[0])
     sys.exit(1)
 
 m = rpds.HashTrieMap({"a": 1, "b": 2})
-check("HashTrieMap get",      m["a"] == 1)
-check("HashTrieMap insert",   m.insert("c", 3)["c"] == 3)
-check("HashTrieMap immutable", "c" not in m)
+check("HashTrieMap get", lambda: m["a"] == 1)
+check("HashTrieMap insert", lambda: m.insert("c", 3)["c"] == 3)
+check("HashTrieMap immutable", lambda: "c" not in m)
 
 s = rpds.HashTrieSet([1, 2, 3])
-check("HashTrieSet contains",  2 in s)
-check("HashTrieSet immutable", 4 not in s)
+check("HashTrieSet contains", lambda: 2 in s)
+check("HashTrieSet immutable", lambda: 4 not in s)
 
 lst = rpds.List([10, 20, 30])
-check("List first", lst.first == 10)
-check("List len",   len(lst) == 3)
+check("List first", lambda: lst.first == 10)
+check("List len", lambda: len(lst) == 3)
+check("List iterates in order", lambda: list(lst) == [10, 20, 30])
+
+# The consumer that matters: jsonschema reaches rpds through referencing, and
+# it leans on the queue type as well as the map. Note peek is a method here
+# while List.first is a property -- do not assume they match.
+q = rpds.Queue([1, 2])
+check("Queue enqueue", lambda: list(q.enqueue(3)) == [1, 2, 3])
+check("Queue peek", lambda: q.peek() == 1)
 
 print()
 print("rpds-py on Python %s  --  %d passed, %d failed" % (
-    sys.version.split()[0], 7 - failures, failures))
-sys.exit(failures)
+    sys.version.split()[0], total - failures, failures))
+sys.exit(1 if failures else 0)
 PYEOF
-  _rc=$?
-  deactivate
-  rm -rf .check_venv
-  return ${_rc}
 }
 
-zopen_custom_install() {
-  _wheel=$(ls rpds_py-*.whl 2>/dev/null | head -1)
-  [ -n "${_wheel}" ] || { printError "No wheel found to install"; return 1; }
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c already prints 0 when nothing matches, and it also
+  # exits 1, so the fallback appended a second zero and the arithmetic below
+  # died with FSUM9224 bad number "0\n0". That fired on every clean run, since
+  # a clean run has no FAIL: lines at all.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  total=$((passed + failed))
 
-  mkdir -p "${ZOPEN_INSTALL_DIR}/lib/python"
-  python3 -m pip install --quiet --no-deps --target="${ZOPEN_INSTALL_DIR}/lib/python" "${_wheel}"
+  # An interpreter whose test produced no lines at all did not pass, it never
+  # ran. Reporting 0/0 as success is how a broken wheel ships.
+  interpreters=$(grep -c "^rpds-py on Python" "${chk}" 2>/dev/null)
+  interpreters=${interpreters:-0}
+  expected=$(echo "${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}" | wc -w | tr -d ' ')
+  if [ "${interpreters}" -lt "${expected}" ]; then
+    silent=$((expected - interpreters))
+    failed=$((failed + silent))
+    total=$((total + silent))
+  fi
 
-  # Stage for the wheel index in the port's artifact directory, which is where
-  # CI looks (install/dist/*.whl). Not under ZOPEN_INSTALL_DIR: that tree is
-  # what gets packaged, so a wheel there ships a second copy of everything
-  # already under lib/python and is invisible to CI.
-  mkdir -p "${ZOPEN_ROOT}/install/dist"
-  cp "${_wheel}" "${ZOPEN_ROOT}/install/dist/"
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
 
-  printInfo "Installed rpds-py ${RPDS_PY_VERSION} from ${_wheel}"
+# The wheels record the extension executable, but pip is not the only thing
+# that puts it in place: zopen packages ZOPEN_INSTALL_DIR into the pax. Make
+# sure the bit survives that, or the module fails to HFS-load with
+# CEE3512S ... reason code EF076015, which reads like a missing symbol.
+zopen_post_install() {
+  for _so in "${ZOPEN_INSTALL_DIR}"/lib/python/rpds/*.so; do
+    [ -f "${_so}" ] && chmod +x "${_so}"
+  done
+  return 0
 }
 
 # Without ZOPEN_BUILD_SYSTEM="Python" nothing adds lib/python to PYTHONPATH --
-# zopen-build only emits that .env snippet for Python-build-system ports -- so
-# the module would install and still not be importable, and the install
+# zopen-build only supplies that .env snippet for Python-build-system ports --
+# so the module would be installed and still not importable, and the install
 # validation below would fail.
 zopen_append_to_env() {
   cat <<ZZ
@@ -136,20 +274,4 @@ ZZ
 
 zopen_append_to_validate_install() {
   echo "python3 -c \"import rpds; print('rpds-py ok')\""
-}
-
-zopen_check_results() {
-  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
-  # No "|| echo 0": grep -c already prints 0 when nothing matches and also
-  # exits 1, so the fallback appended a second zero and $(( )) below died with
-  # FSUM9224 bad number "0\n0" -- on every clean run, since a clean run has no
-  # FAIL: lines. GNU grep behaves the same, so this is not about which grep.
-  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
-  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
-  passed=${passed:-0}
-  failed=${failed:-0}
-  total=$((passed + failed))
-  echo "actualFailures:${failed}"
-  echo "totalTests:${total}"
-  echo "expectedFailures:0"
 }
