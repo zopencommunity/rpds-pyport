@@ -1,0 +1,9 @@
+[target.s390x-ibm-zos]
+linker = "s390x-ibm-zos-cc"
+rustflags = [
+  "--extern", "pyo3_macros=/tmp/libpyo3_macros_rpds.so",
+  "-C", "link-arg=/usr/lpp/IBM/cyp/v3r12/pyz/lib/libpython3.12.x",
+  # Disable s390x vector feature: LLVM z/OS cross-compiler cannot lower
+  # SIMD instructions to HLASM at opt-level>=2
+  "-C", "target-feature=-vector",
+]
