@@ -1,5 +1,5 @@
 # bump: rpds-py-version /RPDS_PY_VERSION="(.*)"/ https://github.com/crate-py/rpds.git|semver:*
-RPDS_PY_VERSION="2026.6.3"
+RPDS_PY_VERSION="2026.9.1"
 
 ###
 ### Build control file for rpds-pyport
